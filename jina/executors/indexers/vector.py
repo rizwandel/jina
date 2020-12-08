@@ -5,7 +5,7 @@ import gzip
 import os
 from functools import lru_cache
 from os import path
-from typing import Optional, List, Union, Tuple, Dict
+from typing import Optional, List, Union, Tuple, Dict, Iterator
 
 import numpy as np
 
@@ -48,6 +48,7 @@ class BaseNumpyIndexer(BaseVectorIndexer):
         self.dtype = None
         self.compress_level = compress_level
         self.key_bytes = b''
+        self.existing_keys = np.array([], dtype=bool)
         self.key_dtype = None
         self._ref_index_abspath = None
 
@@ -57,6 +58,7 @@ class BaseNumpyIndexer(BaseVectorIndexer):
             self.dtype = ref_indexer.dtype
             self.compress_level = ref_indexer.compress_level
             self.key_bytes = ref_indexer.key_bytes
+            self.existing_keys = ref_indexer.existing_keys
             self.key_dtype = ref_indexer.key_dtype
             self._size = ref_indexer._size
             # point to the ref_indexer.index_filename
@@ -115,6 +117,7 @@ class BaseNumpyIndexer(BaseVectorIndexer):
         self._validate_key_vector_shapes(keys, vectors)
         self.write_handler.write(vectors.tobytes())
         self.key_bytes += keys.tobytes()
+        self.existing_keys = np.concatenate((self.existing_keys, np.full(len(keys), True)))
         self.key_dtype = keys.dtype.name
         self._size += keys.shape[0]
 
@@ -123,7 +126,7 @@ class BaseNumpyIndexer(BaseVectorIndexer):
 
         :return: a numpy ndarray of vectors
         """
-        vecs = self.raw_ndarray
+        vecs = self.raw_ndarray[self.existing_keys]
         if vecs is not None:
             return self.build_advanced_index(vecs)
 
@@ -154,18 +157,27 @@ class BaseNumpyIndexer(BaseVectorIndexer):
             return self._load_gzip(self.index_abspath)
         elif self.size is not None and os.stat(self.index_abspath).st_size:
             self.logger.success(f'memmap is enabled for {self.index_abspath}')
-            return np.memmap(self.index_abspath, dtype=self.dtype, mode='r', shape=(self.size, self.num_dim))
+            # `==` is required. `is False` does not work in np
+            deleted_keys = len(self.existing_keys[self.existing_keys == False]) # noqa
+            return np.memmap(self.index_abspath, dtype=self.dtype, mode='r',
+                             shape=(self.size + deleted_keys, self.num_dim))
 
     def query_by_id(self, ids: Union[List[int], 'np.ndarray'], *args, **kwargs) -> 'np.ndarray':
         int_ids = [self.ext2int_id[j] for j in ids]
-        return self.raw_ndarray[int_ids]
+        # TODO discussion on what we want to return on key that has been deleted
+        empty = np.full(self.num_dim, np.nan)
+        return np.array([
+            self.raw_ndarray[idx] if self.existing_keys[idx] else empty.copy() for idx in int_ids
+        ])
 
     @cached_property
     def int2ext_id(self) -> Optional['np.ndarray']:
         """Convert internal ids (0,1,2,3,4,...) to external ids (random index) """
         if self.key_bytes and self.key_dtype:
             r = np.frombuffer(self.key_bytes, dtype=self.key_dtype)
-            if r.shape[0] == self.size == self.raw_ndarray.shape[0]:
+            # `==` is required. `is False` does not work in np
+            deleted_keys = len(self.existing_keys[self.existing_keys == False]) # noqa
+            if r.shape[0] == self.size + deleted_keys == self.raw_ndarray.shape[0]:
                 return r
             else:
                 self.logger.error(
@@ -178,6 +190,19 @@ class BaseNumpyIndexer(BaseVectorIndexer):
         """Convert external ids (random index) to internal ids (0,1,2,3,4,...) """
         if self.int2ext_id is not None:
             return {k: idx for idx, k in enumerate(self.int2ext_id)}
+
+    def update(self, keys: Iterator[int], values: Iterator[bytes], *args, **kwargs):
+        self.delete(keys)
+        self.add(np.array(keys), np.array(values))
+
+    def delete(self, keys: Iterator[int], *args, **kwargs):
+        # TODO check if they exist
+        missed = []
+        for key in keys:
+            # mark as `False` in mask
+            self.existing_keys[self.ext2int_id[key]] = False
+        self._size = self.size - len(list(keys))
+        self.touch()
 
 
 @lru_cache(maxsize=3)
@@ -260,7 +285,8 @@ class NumpyIndexer(BaseNumpyIndexer):
 
         return idx, dist
 
-    def query(self, keys: 'np.ndarray', top_k: int, *args, **kwargs) -> Tuple[Optional['np.ndarray'], Optional['np.ndarray']]:
+    def query(self, queries: 'np.ndarray', top_k: int, *args, **kwargs) -> Tuple[
+        Optional['np.ndarray'], Optional['np.ndarray']]:
         """ Find the top-k vectors with smallest ``metric`` and return their ids in ascending order.
 
         :return: a tuple of two ndarray.
@@ -275,18 +301,19 @@ class NumpyIndexer(BaseNumpyIndexer):
         if self.size == 0:
             return None, None
         if self.metric not in {'cosine', 'euclidean'} or self.backend == 'scipy':
-            dist = self._cdist(keys, self.query_handler)
+            dist = self._cdist(queries, self.query_handler)
         elif self.metric == 'euclidean':
-            _keys = _ext_A(keys)
+            _keys = _ext_A(queries)
             dist = self._euclidean(_keys, self.query_handler)
         elif self.metric == 'cosine':
-            _keys = _ext_A(_norm(keys))
+            _keys = _ext_A(_norm(queries))
             dist = self._cosine(_keys, self.query_handler)
         else:
             raise NotImplementedError(f'{self.metric} is not implemented')
 
         idx, dist = self._get_sorted_top_k(dist, top_k)
-        return self.int2ext_id[idx], dist
+        keys = self.int2ext_id[self.existing_keys][idx]
+        return keys, dist
 
     def build_advanced_index(self, vecs: 'np.ndarray'):
         return vecs
